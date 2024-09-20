@@ -14,18 +14,27 @@ from concurrent.futures import ThreadPoolExecutor
 SLIDE_FORMAT = ["sdpc", "svs", "ndpi", "tiff", "tif", "dcm", "svslide", "bif", "vms", "vmu", "mrxs", "scn"]
 ANNOTATION_FORMAT = ["sdpl", "json"]
 
+
+# 配置 OpenSlide 路径
+OPENSLIDE_PATH = r'E:\Anaconda\envs\DL\Library\openslide-win64-20231011\bin'
+if hasattr(os, 'add_dll_directory'):
+    with os.add_dll_directory(OPENSLIDE_PATH):
+        import openslide
+else:
+    import openslide
+
 parser = argparse.ArgumentParser(description='Code to tile WSI')
 # necessary params.
 parser.add_argument('--data_dir', type=str,
-                    default='',
+                    default=r'G:\前列腺\data',
                     help='dir of slide files')
 parser.add_argument('--save_dir', type=str,
-                    default='',
+                    default=r'G:\前列腺\save',
                     help='dir of patch saving')
 
 # optional params.
 parser.add_argument('--annotation_dir', type=str,
-                    default='',
+                    default=r'G:\前列腺\annotation_json',
                     help='dir of annotation files (optional)')
 parser.add_argument('--color_annotation', 
                     action='store_true', 
@@ -39,8 +48,8 @@ parser.add_argument('--which2cut', type=str, default="magnification", choices=["
                     help='use magnification or resolution to cut patches')
 parser.add_argument('--magnification', type=float, default=20, help='magnification to cut patches: 5x, 20x, 40x, ...')
 parser.add_argument('--resolution', type=float, default=0.4, help='resolution to cut patches: 0.103795, ... (um/pixel)')
-parser.add_argument('--patch_w', type=int, default=256, help='width of patch')
-parser.add_argument('--patch_h', type=int, default=256, help='height of patch')
+parser.add_argument('--patch_w', type=int, default=1024, help='width of patch')
+parser.add_argument('--patch_h', type=int, default=1024, help='height of patch')
 parser.add_argument('--overlap_w', type=int, default=0, help='overlap width of patch')
 parser.add_argument('--overlap_h', type=int, default=0, help='overlap height of patch')
 
