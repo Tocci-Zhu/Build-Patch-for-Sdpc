@@ -10,10 +10,11 @@ import pandas as pd
 from PIL import Image
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor
+from shapely.geometry import shape, box
+import shapely
 
 SLIDE_FORMAT = ["sdpc", "svs", "ndpi", "tiff", "tif", "dcm", "svslide", "bif", "vms", "vmu", "mrxs", "scn"]
 ANNOTATION_FORMAT = ["sdpl", "json"]
-
 
 # 配置 OpenSlide 路径
 OPENSLIDE_PATH = r'E:\Anaconda\envs\DL\Library\openslide-win64-20231011\bin'
@@ -26,22 +27,14 @@ else:
 parser = argparse.ArgumentParser(description='Code to tile WSI')
 # necessary params.
 parser.add_argument('--data_dir', type=str,
-                    default=r'G:\前列腺\data',
+                    default=r'G:\前列腺\data_test',
                     help='dir of slide files')
 parser.add_argument('--save_dir', type=str,
                     default=r'G:\前列腺\save_test',
                     help='dir of patch saving')
-
-# optional params.
 parser.add_argument('--annotation_dir', type=str,
-                    default='',
+                    default=r'G:\前列腺\annotation_test',
                     help='dir of annotation files (optional)')
-parser.add_argument('--color_annotation', 
-                    action='store_true', 
-                    help='use different color annotation (optional)')
-parser.add_argument('--csv_path', type=str,
-                    default=None,
-                    help='path of csv file (optional)')
 
 # general params. (we set the layer at the highest magnification as 40x if no magnification is provided in slide properties)
 parser.add_argument('--which2cut', type=str, default="magnification", choices=["magnification", "resolution"], 
@@ -63,21 +56,17 @@ parser.add_argument('--null_th', type=int, default=10, help='threshold to drop n
 def get_bg_mask(thumbnail, kernel_size=5):
     hsv = cv2.cvtColor(thumbnail, cv2.COLOR_BGR2HSV)
     _, th1 = cv2.threshold(hsv[:, :, 1], 0, 255, cv2.THRESH_OTSU)
-
     close_kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
     image_close = cv2.morphologyEx(np.array(th1), cv2.MORPH_CLOSE, close_kernel)
     open_kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
     _image_open = cv2.morphologyEx(np.array(image_close), cv2.MORPH_OPEN, open_kernel)
     image_open = (_image_open / 255.0).astype(np.uint8)
-
     return image_open
-
 
 def isWhitePatch(patch, satThresh=5):
     patch = np.array(patch)
     patch_hsv = cv2.cvtColor(patch, cv2.COLOR_RGB2HSV)
     return True if np.mean(patch_hsv[:, :, 1]) < satThresh else False
-
 
 def isNullPatch(patch, rgbThresh=10, null_rate=0.9):
     r, g, b = patch.split()
@@ -87,7 +76,6 @@ def isNullPatch(patch, rgbThresh=10, null_rate=0.9):
     rgb_arr = (np.abs(r_arr - g_arr) + np.abs(r_arr - b_arr) + np.abs(g_arr - b_arr)) / 3
     rgb_sum = np.sum(rgb_arr < rgbThresh) / patch.size[0] / patch.size[1]
     return True if rgb_sum > null_rate else False
-
 
 def mag_transfer(slide, sdpc_path, magnification, resolution, patch_w, patch_h, 
                  overlap_w, overlap_h, which2cut="magnification"):
@@ -124,22 +112,34 @@ def mag_transfer(slide, sdpc_path, magnification, resolution, patch_w, patch_h,
     y_offset = int(y_size / zoomrate)
     return x_size, y_size, x_step, y_step, x_offset, y_offset, WSI_level
 
-
-def img_detect(save_dir, slide, coord, bg_mask, marked_img, WSI_level, slide_x, slide_y, patch_w, patch_h, 
-               x_size, y_size, x_offset, y_offset, use_otsu, blank_rate_th, rgbThresh):
+def img_detect(save_dir, slide, coord, bg_mask, marked_img, marked_img_red, thumbnail_mask, WSI_level, slide_x, slide_y, patch_w, patch_h,
+               x_size, y_size, x_offset, y_offset, use_otsu, blank_rate_th, rgbThresh, border_color, geometries=None):
     x_start, y_start = coord[0], coord[1]
     mask_start_x = int(np.floor(x_start / slide_x * bg_mask.shape[1]))
     mask_start_y = int(np.floor(y_start / slide_y * bg_mask.shape[0]))
     mask_end_x = int(np.ceil((x_start + x_size) / slide_x * bg_mask.shape[1]))
     mask_end_y = int(np.ceil((y_start + y_size) / slide_y * bg_mask.shape[0]))
     mask = bg_mask[mask_start_y:mask_end_y, mask_start_x:mask_end_x]
-    patch_save_path = os.path.join(save_dir, '{}_{}_{}_{}.png'.format(x_start, y_start, x_start + x_size, y_start + y_size))
+    
+    # 检查是否在geojson定义的区域内
+    save_path = save_dir
+    if geometries:
+        patch_polygon = shapely.geometry.box(x_start, y_start, x_start + x_size, y_start + y_size)
+        if any(geometry.intersects(patch_polygon) for geometry in geometries):
+            save_path = os.path.join(save_dir, 'mark')
+            os.makedirs(save_path, exist_ok=True)
+            border_color = (0, 255, 0)  # 如果在标注区域内，用绿色边框
+            # 在 thumbnail_mask 上绘制对应区域
+            cv2.rectangle(thumbnail_mask, (mask_start_x, mask_start_y), (mask_end_x, mask_end_y), (0, 255, 0), -1)
+    
+    patch_save_path = os.path.join(save_path, '{}_{}_{}_{}.png'.format(x_start, y_start, x_start + x_size, y_start + y_size))
 
     img_flag = False
     if not use_otsu:
         img_flag = True
     elif mask.size > 0 and (np.sum(mask == 0) / mask.size) < blank_rate_th:
         img_flag = True
+    
     if img_flag:
         try:
             img = slide.read_region((x_start, y_start), WSI_level, (x_offset, y_offset))
@@ -148,11 +148,29 @@ def img_detect(save_dir, slide, coord, bg_mask, marked_img, WSI_level, slide_x, 
             img = img.convert('RGB')
             img.thumbnail((patch_w, patch_h))
             if not isWhitePatch(img) and not isNullPatch(img, rgbThresh=rgbThresh):
-                cv2.rectangle(marked_img, (mask_start_x, mask_start_y), (mask_end_x, mask_end_y), (255, 0, 0), 2)
+                # 在 marked_img 上绘制绿色边框 (geojson 标注区域)
+                cv2.rectangle(marked_img, (mask_start_x, mask_start_y), (mask_end_x, mask_end_y), (0, 255, 0), 2)
+                # 在 marked_img_red 上绘制红色边框 (所有图像块)
+                cv2.rectangle(marked_img_red, (mask_start_x, mask_start_y), (mask_end_x, mask_end_y), (255, 0, 0), 2)
                 img.save(patch_save_path)
+            return img  # 返回绘制矩形的图像
         except Exception as e:
             print(str(e))
+            return None
+    return None
+def read_geojson(geojson_path):
+    with open(geojson_path, 'r') as f:
+        geojson_data = json.load(f)
+    geometries = [shape(feature['geometry']) for feature in geojson_data['features']]
+    return geometries
 
+def is_patch_in_geojson(patch_coords, geometries, slide_dimensions):
+    x, y, w, h = patch_coords
+    patch_polygon = shapely.geometry.box(x, y, x + w, y + h)  # 使用完整的命名空间
+    for geometry in geometries:
+        if geometry.intersects(patch_polygon) or patch_polygon.intersects(geometry) or patch_polygon.contains(geometry):
+            return True
+    return False
 
 class Slide2Patch():
     def __init__(self, args):
@@ -162,7 +180,6 @@ class Slide2Patch():
         self.which2cut = args.which2cut
         self.magnification = args.magnification
         self.resolution = args.resolution
-
         self.save_dir = args.save_dir
         self.null_th = args.null_th
         self.thumbnail_level = args.thumbnail_level
@@ -170,7 +187,12 @@ class Slide2Patch():
         self.use_otsu = args.use_otsu
         self.blank_rate_th = args.blank_rate_th
 
-    def save_patch(self, data_path, coords=None, color_dirs=None):
+    def save_patch(self, data_path, geojson_path=None, **kwargs):
+        if geojson_path:
+            geometries = read_geojson(geojson_path)
+        else:
+            geometries = None
+
         if data_path.split(".")[-1] == "sdpc":
             from sdpc.Sdpc import Sdpc
             slide = Sdpc(data_path)
@@ -179,49 +201,67 @@ class Slide2Patch():
             import openslide
             slide = openslide.open_slide(data_path)
             thumbnail = slide.get_thumbnail(slide.level_dimensions[-self.thumbnail_level])
+            
         if isinstance(thumbnail, np.ndarray):
             pass
         else:
             thumbnail = np.array(thumbnail.convert('RGB'))
-        bg_mask = get_bg_mask(thumbnail)
-        marked_img = thumbnail.copy()
+        
+        # 生成背景掩码（bg_mask），用于确定哪些区域是空白的
+        bg_mask = get_bg_mask(thumbnail)  # 添加这一行
+        marked_img = thumbnail.copy()      # 绿色边框 (标注区域)
+        marked_img_red = thumbnail.copy()  # 红色边框 (所有图像块)
+        thumbnail_mask = np.zeros_like(thumbnail)  # 初始化掩码图像
 
         x_size, y_size, x_step, y_step, x_offset, y_offset, WSI_level = mag_transfer(slide,
-                                                                                     data_path,
-                                                                                     self.magnification, 
-                                                                                     self.resolution, 
-                                                                                     self.patch_w, 
-                                                                                     self.patch_h,
-                                                                                     self.overlap_w,
-                                                                                     self.overlap_h,
-                                                                                     self.which2cut)
+                                                                                    data_path,
+                                                                                    self.magnification, 
+                                                                                    self.resolution, 
+                                                                                    self.patch_w, 
+                                                                                    self.patch_h,
+                                                                                    self.overlap_w,
+                                                                                    self.overlap_h,
+                                                                                    self.which2cut)
 
         slide_x, slide_y = slide.level_dimensions[0]
         thumbnail_save_dir = os.path.join(self.save_dir, os.path.basename(data_path).split('.')[0], 'thumbnail')
         os.makedirs(thumbnail_save_dir, exist_ok=True)
         save_dir = os.path.join(self.save_dir, os.path.basename(data_path).split('.')[0])
-        if color_dirs is not None:
-            for color_dir in np.unique(color_dirs):
-                os.makedirs(os.path.join(save_dir, color_dir), exist_ok=True)
+        
+        if geojson_path:
+            mark_dir = os.path.join(save_dir, 'mark')
+            os.makedirs(mark_dir, exist_ok=True)
 
-        if coords is None:
+        if not kwargs.get('coords'):
             coords = []
             for i in range(int(np.floor((slide_x - x_size) / x_step + 1))):
                 for j in range(int(np.floor((slide_y - y_size) / y_step + 1))):
                     coords.append([i * x_step, j * y_step])
+
         pool = ThreadPoolExecutor(20)
         with tqdm(total=len(coords)) as pbar:
             for i, coord in enumerate(coords):
-                if color_dirs is None:
-                    _save_dir = save_dir
-                else:
-                    _save_dir = os.path.join(save_dir, color_dirs[i])
-                pool.submit(img_detect, _save_dir, slide, coord, bg_mask, marked_img, WSI_level, slide_x, slide_y, self.patch_w, self.patch_h, 
-                            x_size, y_size, x_offset, y_offset, self.use_otsu, self.blank_rate_th, self.null_th)
+                future = pool.submit(img_detect, save_dir, slide, coord, bg_mask, marked_img, marked_img_red, thumbnail_mask, WSI_level, slide_x, slide_y,
+                                    self.patch_w, self.patch_h, x_size, y_size, x_offset, y_offset, 
+                                    self.use_otsu, self.blank_rate_th, self.null_th, (255, 0, 0), geometries)
                 pbar.update(1)
         pool.shutdown()
-        Image.fromarray(marked_img).save(os.path.join(thumbnail_save_dir, 'thumbnail.png'))
-    
+
+        # 保存缩略图：所有图像块为红色边框
+        thumbnail_path = os.path.join(thumbnail_save_dir, 'thumbnail.png')
+        Image.fromarray(marked_img_red).save(thumbnail_path)
+
+        # 保存缩略图：标注区域为绿色边框
+        thumbnail_mark_path = os.path.join(thumbnail_save_dir, 'thumbnail_mark.png')
+        Image.fromarray(marked_img).save(thumbnail_mark_path)
+
+        # 保存掩码图像
+        thumbnail_mask_path = os.path.join(thumbnail_save_dir, 'thumbnail_mask.png')
+        Image.fromarray(cv2.cvtColor(thumbnail_mask, cv2.COLOR_BGR2RGB)).save(thumbnail_mask_path)
+
+        print(f"Thumbnail with red markings saved at: {thumbnail_path}")
+        print(f"Thumbnail with green markings saved at: {thumbnail_mark_path}")
+        print(f"Thumbnail mask saved at: {thumbnail_mask_path}")   
     def cut_with_annotation(self, annotation_dir, sdpc_path, color_annotation):
         json_name = os.path.basename(sdpc_path).split(".")[0] + ".*"
         annotation_paths = glob.glob(os.path.join(annotation_dir, json_name))
@@ -245,14 +285,14 @@ class Slide2Patch():
             import openslide
             slide = openslide.open_slide(data_path)
         x_size, y_size, x_step, y_step, _, _, _ = mag_transfer(slide,
-                                                               data_path,
-                                                               self.magnification, 
-                                                               self.resolution, 
-                                                               self.patch_w, 
-                                                               self.patch_h,
-                                                               self.overlap_w,
-                                                               self.overlap_h,
-                                                               self.which2cut)
+                                                            data_path,
+                                                            self.magnification, 
+                                                            self.resolution, 
+                                                            self.patch_w, 
+                                                            self.patch_h,
+                                                            self.overlap_w,
+                                                            self.overlap_h,
+                                                            self.which2cut)
         coords = []
         colors = []
         if 'GroupModel' in label_dic.keys():
@@ -300,10 +340,10 @@ class Slide2Patch():
                         test_x_right = int(x0 + x * x_step + x_size / 2)
                         test_y_top = int(y0 + y * y_step + y_size / 2)
                         test_list = [(x0 + x * x_step, y0 + y * y_step),
-                                     (test_x_left, test_y_top), 
-                                     (test_x_left, test_y_bottom), 
-                                     (test_x_right, test_y_top), 
-                                     (test_x_right, test_y_bottom)]
+                                    (test_x_left, test_y_top), 
+                                    (test_x_left, test_y_bottom), 
+                                    (test_x_right, test_y_top), 
+                                    (test_x_right, test_y_bottom)]
                         for test_point in test_list:
                             if cv2.pointPolygonTest(Pointslist, test_point, False) >= 0:
                                 coords.append([test_x_left, test_y_bottom])
@@ -313,46 +353,29 @@ class Slide2Patch():
             return coords, colors
         else:
             return coords, None
-
+        
 
 if __name__ == '__main__':    
     args = parser.parse_args()
     Auto_Build = Slide2Patch(args)
-
-    csv_cases = None
-    csv_slides = None
-    if args.csv_path is not None:
-        csv_file = pd.read_csv(args.csv_path, encoding="gbk")
-        csv_slides = csv_file["slide_id"].dropna().tolist()
 
     _files = []
     for root, _, files in os.walk(args.data_dir):
         for file in files:
             file_format = file.split(".")[-1]
             if file_format in SLIDE_FORMAT:
-                if csv_cases is None and csv_slides is None:
-                    _files.append(os.path.join(root, file))
-                else:
-                    file_slide_id = file.split(".")[0]
-                    if file_slide_id in csv_slides:
-                        _files.append(os.path.join(root, file))
+                _files.append(os.path.join(root, file))
     _files = sorted(_files)
-    
+
     for i, file in enumerate(_files):
-        file_name = os.path.basename(file).split('.')[0]
-        save_path = os.path.join(args.save_dir, file_name)
-        if os.path.exists(save_path):
-            if os.path.exists(os.path.join(save_path, 'thumbnail', 'thumbnail.png')):
-                continue
-
-        print('----------* {}/{} Processing: {} *----------'.format(i + 1, len(_files), file))
-        time_start = time.time()
-        if os.path.exists(args.annotation_dir):
-            Auto_Build.cut_with_annotation(args.annotation_dir, file, args.color_annotation)
+        file_name = os.path.basename(file)
+        geojson_filename = file_name.replace('.' + file_name.split('.')[-1], '.geojson')
+        geojson_path = os.path.join(args.annotation_dir, geojson_filename)
+        if os.path.exists(geojson_path):
+            print(f"Processing with geojson: {geojson_path}")
+            Auto_Build.save_patch(file, geojson_path=geojson_path)
         else:
+            print(f"No geojson file found for {file_name}, processing without geojson.")
             Auto_Build.save_patch(file)
-
-        time_end = time.time()
-        print('total time:', time_end - time_start)
 
     print('-----------------* Patch Reading Finished *---------------------')
