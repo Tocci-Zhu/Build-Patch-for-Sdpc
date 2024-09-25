@@ -27,13 +27,13 @@ else:
 parser = argparse.ArgumentParser(description='Code to tile WSI')
 # necessary params.
 parser.add_argument('--data_dir', type=str,
-                    default=r'G:\前列腺\data_test',
+                    default=r'G:\前列腺\data',
                     help='dir of slide files')
 parser.add_argument('--save_dir', type=str,
-                    default=r'G:\前列腺\save_test',
+                    default=r'G:\前列腺\save',
                     help='dir of patch saving')
 parser.add_argument('--annotation_dir', type=str,
-                    default=r'G:\前列腺\annotation_test',
+                    default=r'G:\前列腺\annotation',
                     help='dir of annotation files (optional)')
 
 # general params. (we set the layer at the highest magnification as 40x if no magnification is provided in slide properties)
@@ -112,7 +112,7 @@ def mag_transfer(slide, sdpc_path, magnification, resolution, patch_w, patch_h,
     y_offset = int(y_size / zoomrate)
     return x_size, y_size, x_step, y_step, x_offset, y_offset, WSI_level
 
-def img_detect(save_dir, slide, coord, bg_mask, marked_img, marked_img_red, thumbnail_mask, WSI_level, slide_x, slide_y, patch_w, patch_h,
+def img_detect(save_dir, slide, coord, bg_mask, marked_img_red, thumbnail, thumbnail_mark, WSI_level, slide_x, slide_y, patch_w, patch_h,
                x_size, y_size, x_offset, y_offset, use_otsu, blank_rate_th, rgbThresh, border_color, geometries=None):
     x_start, y_start = coord[0], coord[1]
     mask_start_x = int(np.floor(x_start / slide_x * bg_mask.shape[1]))
@@ -129,8 +129,8 @@ def img_detect(save_dir, slide, coord, bg_mask, marked_img, marked_img_red, thum
             save_path = os.path.join(save_dir, 'mark')
             os.makedirs(save_path, exist_ok=True)
             border_color = (0, 255, 0)  # 如果在标注区域内，用绿色边框
-            # 在 thumbnail_mask 上绘制对应区域
-            cv2.rectangle(thumbnail_mask, (mask_start_x, mask_start_y), (mask_end_x, mask_end_y), (0, 255, 0), -1)
+            # 在 thumbnail_mark 上绘制对应区域
+            cv2.rectangle(thumbnail_mark, (mask_start_x, mask_start_y), (mask_end_x, mask_end_y), border_color, -1)
     
     patch_save_path = os.path.join(save_path, '{}_{}_{}_{}.png'.format(x_start, y_start, x_start + x_size, y_start + y_size))
 
@@ -148,8 +148,6 @@ def img_detect(save_dir, slide, coord, bg_mask, marked_img, marked_img_red, thum
             img = img.convert('RGB')
             img.thumbnail((patch_w, patch_h))
             if not isWhitePatch(img) and not isNullPatch(img, rgbThresh=rgbThresh):
-                # 在 marked_img 上绘制绿色边框 (geojson 标注区域)
-                cv2.rectangle(marked_img, (mask_start_x, mask_start_y), (mask_end_x, mask_end_y), (0, 255, 0), 2)
                 # 在 marked_img_red 上绘制红色边框 (所有图像块)
                 cv2.rectangle(marked_img_red, (mask_start_x, mask_start_y), (mask_end_x, mask_end_y), (255, 0, 0), 2)
                 img.save(patch_save_path)
@@ -158,6 +156,7 @@ def img_detect(save_dir, slide, coord, bg_mask, marked_img, marked_img_red, thum
             print(str(e))
             return None
     return None
+
 def read_geojson(geojson_path):
     with open(geojson_path, 'r') as f:
         geojson_data = json.load(f)
@@ -201,7 +200,7 @@ class Slide2Patch():
             import openslide
             slide = openslide.open_slide(data_path)
             thumbnail = slide.get_thumbnail(slide.level_dimensions[-self.thumbnail_level])
-            
+        
         if isinstance(thumbnail, np.ndarray):
             pass
         else:
@@ -209,9 +208,8 @@ class Slide2Patch():
         
         # 生成背景掩码（bg_mask），用于确定哪些区域是空白的
         bg_mask = get_bg_mask(thumbnail)  # 添加这一行
-        marked_img = thumbnail.copy()      # 绿色边框 (标注区域)
         marked_img_red = thumbnail.copy()  # 红色边框 (所有图像块)
-        thumbnail_mask = np.zeros_like(thumbnail)  # 初始化掩码图像
+        thumbnail_mark = thumbnail.copy()  # 使用原始缩略图作为背景
 
         x_size, y_size, x_step, y_step, x_offset, y_offset, WSI_level = mag_transfer(slide,
                                                                                     data_path,
@@ -227,7 +225,7 @@ class Slide2Patch():
         thumbnail_save_dir = os.path.join(self.save_dir, os.path.basename(data_path).split('.')[0], 'thumbnail')
         os.makedirs(thumbnail_save_dir, exist_ok=True)
         save_dir = os.path.join(self.save_dir, os.path.basename(data_path).split('.')[0])
-        
+    
         if geojson_path:
             mark_dir = os.path.join(save_dir, 'mark')
             os.makedirs(mark_dir, exist_ok=True)
@@ -241,7 +239,7 @@ class Slide2Patch():
         pool = ThreadPoolExecutor(20)
         with tqdm(total=len(coords)) as pbar:
             for i, coord in enumerate(coords):
-                future = pool.submit(img_detect, save_dir, slide, coord, bg_mask, marked_img, marked_img_red, thumbnail_mask, WSI_level, slide_x, slide_y,
+                future = pool.submit(img_detect, save_dir, slide, coord, bg_mask, marked_img_red, thumbnail, thumbnail_mark, WSI_level, slide_x, slide_y,
                                     self.patch_w, self.patch_h, x_size, y_size, x_offset, y_offset, 
                                     self.use_otsu, self.blank_rate_th, self.null_th, (255, 0, 0), geometries)
                 pbar.update(1)
@@ -251,17 +249,12 @@ class Slide2Patch():
         thumbnail_path = os.path.join(thumbnail_save_dir, 'thumbnail.png')
         Image.fromarray(marked_img_red).save(thumbnail_path)
 
-        # 保存缩略图：标注区域为绿色边框
-        thumbnail_mark_path = os.path.join(thumbnail_save_dir, 'thumbnail_mark.png')
-        Image.fromarray(marked_img).save(thumbnail_mark_path)
-
         # 保存掩码图像
-        thumbnail_mask_path = os.path.join(thumbnail_save_dir, 'thumbnail_mask.png')
-        Image.fromarray(cv2.cvtColor(thumbnail_mask, cv2.COLOR_BGR2RGB)).save(thumbnail_mask_path)
+        thumbnail_mark_path = os.path.join(thumbnail_save_dir, 'thumbnail_mark.png')
+        Image.fromarray(thumbnail_mark).save(thumbnail_mark_path)
 
         print(f"Thumbnail with red markings saved at: {thumbnail_path}")
-        print(f"Thumbnail with green markings saved at: {thumbnail_mark_path}")
-        print(f"Thumbnail mask saved at: {thumbnail_mask_path}")   
+        print(f"Thumbnail mask saved at: {thumbnail_mark_path}")    
     def cut_with_annotation(self, annotation_dir, sdpc_path, color_annotation):
         json_name = os.path.basename(sdpc_path).split(".")[0] + ".*"
         annotation_paths = glob.glob(os.path.join(annotation_dir, json_name))
